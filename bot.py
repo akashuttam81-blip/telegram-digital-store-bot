@@ -9,6 +9,21 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from flask import Flask
+from threading import Thread
+
+app_web = Flask('')
+
+@app_web.route('/')
+def home():
+    return "Bot is running!"
+
+def run():
+    app_web.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
 BOT_TOKEN = "8271855633:AAHAZlj8kP-mF22EFIvPFHCdITwRzbW0B4c"
 ADMIN_ID = 7662708655
@@ -356,4 +371,6 @@ app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
+keep_alive()
 app.run_polling()
+
