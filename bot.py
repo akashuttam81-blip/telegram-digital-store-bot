@@ -1,255 +1,359 @@
-import telebot
 import sqlite3
-from telebot import types
+import re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-TOKEN = "8271855633:AAHAZlj8kP-mF22EFIvPFHCdITwRzbW0B4c"
-ADMIN_ID = 7662708655  # apna telegram id
-QR_IMAGE = "qr.png"  # yahan apna fixed QR image rakhein
+BOT_TOKEN = "8271855633:AAHAZlj8kP-mF22EFIvPFHCdITwRzbW0B4c"
+ADMIN_ID = 7662708655
 
-bot = telebot.TeleBot(TOKEN)
+# ================= DATABASE ================= #
 
-conn = sqlite3.connect("database.db", check_same_thread=False)
+conn = sqlite3.connect("store.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# ================= DATABASE =================
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS users(
-    user_id INTEGER PRIMARY KEY
-)""")
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS coupons(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    amount INTEGER,
-    code TEXT
-)""")
-
-cursor.execute("""CREATE TABLE IF NOT EXISTS settings(
-    amount INTEGER PRIMARY KEY,
+    name TEXT,
     price INTEGER
-)""")
+)
+""")
 
-cursor.execute("""CREATE TABLE IF NOT EXISTS payments(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS coupons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER,
+    code TEXT UNIQUE,
+    used INTEGER DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    amount INTEGER,
-    qty INTEGER,
+    product_id INTEGER,
+    quantity INTEGER,
+    total INTEGER,
     utr TEXT UNIQUE,
+    screenshot TEXT UNIQUE,
     status TEXT
-)""")
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER UNIQUE
+)
+""")
 
 conn.commit()
 
-# Default prices
-cursor.execute("INSERT OR IGNORE INTO settings VALUES(500,20)")
-cursor.execute("INSERT OR IGNORE INTO settings VALUES(1000,110)")
-conn.commit()
+# ================= START ================= #
 
-
-# ================= START =================
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.from_user.id
-    cursor.execute("INSERT OR IGNORE INTO users VALUES(?)",(user_id,))
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
 
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("₹500 Coupon","₹1000 Coupon")
-    markup.add("Stock")
-
     if user_id == ADMIN_ID:
-        markup.add("Admin Panel")
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+            [InlineKeyboardButton("➕ Add Coupons", callback_data="add_coupon")],
+            [InlineKeyboardButton("➖ Delete Coupon", callback_data="delete_coupon")],
+            [InlineKeyboardButton("🗑 Delete Product", callback_data="delete_product")],
+            [InlineKeyboardButton("📦 View Products", callback_data="view_products")],
+            [InlineKeyboardButton("📊 Pending Orders", callback_data="pending")],
+            [InlineKeyboardButton("📈 Sales", callback_data="sales")],
+            [InlineKeyboardButton("👥 Users", callback_data="users")]
+        ]
+        await update.message.reply_text("👑 FULL ADMIN PANEL",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await show_products(update)
 
-    bot.send_message(user_id,"Select option:",reply_markup=markup)
+# ================= SHOW PRODUCTS ================= #
 
+async def show_products(update):
+    cursor.execute("SELECT * FROM products")
+    products = cursor.fetchall()
+    keyboard = []
 
-# ================= STOCK =================
+    for p in products:
+        cursor.execute("SELECT COUNT(*) FROM coupons WHERE product_id=? AND used=0", (p[0],))
+        stock = cursor.fetchone()[0]
 
-@bot.message_handler(func=lambda m: m.text=="Stock")
-def stock(message):
-    cursor.execute("SELECT COUNT(*) FROM coupons WHERE amount=500")
-    s500 = cursor.fetchone()[0]
+        if stock > 0:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{p[1]} - ₹{p[2]} ({stock} left)",
+                    callback_data=f"buy_{p[0]}"
+                )
+            ])
 
-    cursor.execute("SELECT COUNT(*) FROM coupons WHERE amount=1000")
-    s1000 = cursor.fetchone()[0]
-
-    bot.reply_to(message,f"📦 Stock\n500₹ = {s500}\n1000₹ = {s1000}")
-
-
-# ================= BUY =================
-
-@bot.message_handler(func=lambda m: m.text in ["₹500 Coupon","₹1000 Coupon"])
-def buy_coupon(message):
-    amount = 500 if "500" in message.text else 1000
-    bot.send_message(message.chat.id,"Quantity bhejein (number)")
-    bot.register_next_step_handler(message,process_qty,amount)
-
-
-def process_qty(message,amount):
-    try:
-        qty = int(message.text)
-
-        cursor.execute("SELECT price FROM settings WHERE amount=?",(amount,))
-        price = cursor.fetchone()[0]
-
-        total = price * qty
-
-        bot.send_message(message.chat.id,f"Total Payment: ₹{total}\nQR scan karein aur UTR bhejein.")
-        bot.send_photo(message.chat.id,open(QR_IMAGE,"rb"))
-
-        bot.register_next_step_handler(message,process_utr,amount,qty)
-
-    except:
-        bot.send_message(message.chat.id,"Invalid quantity")
-
-
-def process_utr(message,amount,qty):
-    utr = message.text
-    user_id = message.from_user.id
-
-    try:
-        cursor.execute("INSERT INTO payments(user_id,amount,qty,utr,status) VALUES(?,?,?,?,?)",
-                       (user_id,amount,qty,utr,"pending"))
-        conn.commit()
-
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("✅ Confirm",callback_data="approve_"+utr),
-            types.InlineKeyboardButton("❌ Wrong",callback_data="reject_"+utr)
-        )
-
-        bot.send_message(ADMIN_ID,
-            f"New Payment\nUser:{user_id}\nAmount:{amount}\nQty:{qty}\nUTR:{utr}",
-            reply_markup=markup)
-
-        bot.send_message(user_id,"⏳ Payment Pending Admin Approval")
-
-    except:
-        bot.send_message(user_id,"❌ Duplicate UTR Blocked")
-
-
-# ================= ADMIN CALLBACK =================
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-
-    if call.from_user.id != ADMIN_ID:
+    if not keyboard:
+        await update.message.reply_text("❌ Out Of Stock")
         return
 
-    action, utr = call.data.split("_")
+    await update.message.reply_text("🛍 Select Product:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
 
-    cursor.execute("SELECT user_id,amount,qty FROM payments WHERE utr=? AND status='pending'",(utr,))
-    data = cursor.fetchone()
+# ================= BUTTON HANDLER ================= #
 
-    if not data:
-        return
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
 
-    user_id,amount,qty = data
+    # ---------- BUY PRODUCT ---------- #
+    if data.startswith("buy_"):
+        pid = int(data.split("_")[1])
 
-    if action=="approve":
+        cursor.execute("SELECT COUNT(*) FROM coupons WHERE product_id=? AND used=0", (pid,))
+        stock = cursor.fetchone()[0]
 
-        cursor.execute("SELECT id,code FROM coupons WHERE amount=? LIMIT ?",(amount,qty))
-        coupons = cursor.fetchall()
-
-        if len(coupons) < qty:
-            bot.send_message(user_id,"❌ Out Of Stock")
+        if stock == 0:
+            await query.message.reply_text("❌ Out Of Stock")
             return
 
-        codes = ""
-        for c in coupons:
-            codes += c[1]+"\n"
-            cursor.execute("DELETE FROM coupons WHERE id=?",(c[0],))
+        context.user_data["product_id"] = pid
 
-        cursor.execute("UPDATE payments SET status='approved' WHERE utr=?",(utr,))
+        qty_buttons = [1, 2, 5, 10]
+        buttons = []
+
+        available = [
+            InlineKeyboardButton(str(q), callback_data=f"qty_{q}")
+            for q in qty_buttons if q <= stock
+        ]
+
+        for i in range(0, len(available), 2):
+            buttons.append(available[i:i+2])
+
+        await query.message.reply_text(
+            f"Available Stock: {stock}\n\nSelect Quantity:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    # ---------- SELECT QUANTITY ---------- #
+    elif data.startswith("qty_"):
+        qty = int(data.split("_")[1])
+        pid = context.user_data.get("product_id")
+
+        cursor.execute("SELECT COUNT(*) FROM coupons WHERE product_id=? AND used=0", (pid,))
+        stock = cursor.fetchone()[0]
+
+        if qty > stock:
+            await query.message.reply_text("❌ Stock changed. Try again.")
+            return
+
+        cursor.execute("SELECT price FROM products WHERE id=?", (pid,))
+        price = cursor.fetchone()[0]
+        total = price * qty
+
+        context.user_data["quantity"] = qty
+        context.user_data["total"] = total
+        context.user_data["awaiting_utr"] = True
+
+        await context.bot.send_photo(
+            chat_id=user_id,
+            photo=open("qr.jpg", "rb"),
+            caption=f"💰 Total: ₹{total}\n\n📲 Scan QR & Pay\n\nSend 12 digit UTR."
+        )
+
+    # ---------- ADMIN FEATURES ---------- #
+    elif user_id == ADMIN_ID:
+
+        if data == "add_product":
+            context.user_data["adding_product"] = True
+            await query.message.reply_text("Send: ProductName - Price")
+
+        elif data == "add_coupon":
+            context.user_data["adding_coupon"] = True
+            await query.message.reply_text("Send: ProductID CODE")
+
+        elif data == "delete_coupon":
+            context.user_data["deleting_coupon"] = True
+            await query.message.reply_text("Send Coupon Code")
+
+        elif data == "delete_product":
+            context.user_data["deleting_product"] = True
+            await query.message.reply_text("Send Product ID")
+
+        elif data == "view_products":
+            cursor.execute("SELECT * FROM products")
+            products = cursor.fetchall()
+            text = "📦 Products:\n\n"
+            for p in products:
+                cursor.execute("SELECT COUNT(*) FROM coupons WHERE product_id=? AND used=0", (p[0],))
+                stock = cursor.fetchone()[0]
+                text += f"{p[0]}. {p[1]} | ₹{p[2]} | Stock: {stock}\n"
+            await query.message.reply_text(text)
+
+        elif data == "pending":
+            cursor.execute("SELECT * FROM orders WHERE status='pending'")
+            orders = cursor.fetchall()
+
+            if not orders:
+                await query.message.reply_text("No Pending Orders")
+                return
+
+            for o in orders:
+                keyboard = [[
+                    InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_{o[0]}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_{o[0]}")
+                ]]
+                await query.message.reply_text(
+                    f"OrderID: {o[0]}\nUser: {o[1]}\nUTR: {o[5]}\nTotal: ₹{o[4]}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+
+        elif data.startswith("confirm_"):
+            oid = int(data.split("_")[1])
+            cursor.execute("SELECT * FROM orders WHERE id=?", (oid,))
+            order = cursor.fetchone()
+
+            pid = order[2]
+            qty = order[3]
+            user = order[1]
+
+            cursor.execute(
+                "SELECT id, code FROM coupons WHERE product_id=? AND used=0 LIMIT ?",
+                (pid, qty)
+            )
+            coupons = cursor.fetchall()
+
+            codes = []
+            for c in coupons:
+                cursor.execute("UPDATE coupons SET used=1 WHERE id=?", (c[0],))
+                codes.append(c[1])
+
+            cursor.execute("UPDATE orders SET status='confirmed' WHERE id=?", (oid,))
+            conn.commit()
+
+            await context.bot.send_message(
+                user,
+                "🎉 Payment Confirmed!\n\nYour Coupons:\n\n" + "\n".join(codes)
+            )
+
+            await query.message.reply_text("✅ Delivered")
+
+        elif data.startswith("reject_"):
+            oid = int(data.split("_")[1])
+            cursor.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
+            conn.commit()
+            await query.message.reply_text("❌ Rejected")
+
+        elif data == "sales":
+            cursor.execute("SELECT COUNT(*), SUM(total) FROM orders WHERE status='confirmed'")
+            count, total = cursor.fetchone()
+            await query.message.reply_text(
+                f"📊 Orders: {count}\nRevenue: ₹{total if total else 0}"
+            )
+
+        elif data == "users":
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            await query.message.reply_text(f"👥 Total Users: {total_users}")
+
+# ================= TEXT HANDLER ================= #
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # Admin product
+    if context.user_data.get("adding_product") and user_id == ADMIN_ID:
+        name, price = text.split("-")
+        cursor.execute("INSERT INTO products (name, price) VALUES (?, ?)",
+                       (name.strip(), int(price.strip())))
         conn.commit()
+        context.user_data.clear()
+        await update.message.reply_text("✅ Product Added")
 
-        bot.send_message(user_id,f"✅ Payment Approved\nYour Coupons:\n{codes}")
-
-    elif action=="reject":
-        cursor.execute("UPDATE payments SET status='rejected' WHERE utr=?",(utr,))
+    elif context.user_data.get("adding_coupon") and user_id == ADMIN_ID:
+        pid, code = text.split()
+        cursor.execute("INSERT INTO coupons (product_id, code) VALUES (?, ?)",
+                       (int(pid), code))
         conn.commit()
-        bot.send_message(user_id,"❌ Payment Marked Wrong")
+        context.user_data.clear()
+        await update.message.reply_text("✅ Coupon Added")
 
-    bot.answer_callback_query(call.id,"Done")
+    elif context.user_data.get("deleting_coupon") and user_id == ADMIN_ID:
+        cursor.execute("DELETE FROM coupons WHERE code=?", (text,))
+        conn.commit()
+        context.user_data.clear()
+        await update.message.reply_text("🗑 Coupon Deleted")
 
+    elif context.user_data.get("deleting_product") and user_id == ADMIN_ID:
+        cursor.execute("DELETE FROM products WHERE id=?", (int(text),))
+        conn.commit()
+        context.user_data.clear()
+        await update.message.reply_text("🗑 Product Deleted")
 
-# ================= ADMIN PANEL =================
+    # User UTR
+    elif context.user_data.get("awaiting_utr"):
+        if not re.fullmatch(r"\d{12}", text):
+            await update.message.reply_text("❌ Send valid 12 digit UTR")
+            return
 
-@bot.message_handler(func=lambda m: m.text=="Admin Panel")
-def admin_panel(message):
-    if message.from_user.id != ADMIN_ID:
+        cursor.execute("SELECT id FROM orders WHERE utr=?", (text,))
+        if cursor.fetchone():
+            await update.message.reply_text("❌ UTR already used")
+            return
+
+        context.user_data["utr"] = text
+        context.user_data["awaiting_utr"] = False
+        context.user_data["awaiting_ss"] = True
+        await update.message.reply_text("📸 Send Payment Screenshot")
+
+# ================= PHOTO HANDLER ================= #
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_ss"):
         return
 
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("Add Coupon","Set Price")
-    markup.add("Users Count","Broadcast")
-    markup.add("Back")
+    user_id = update.effective_user.id
+    utr = context.user_data.get("utr")
+    pid = context.user_data.get("product_id")
+    qty = context.user_data.get("quantity")
+    total = context.user_data.get("total")
 
-    bot.send_message(message.chat.id,"Admin Panel:",reply_markup=markup)
+    file_id = update.message.photo[-1].file_id
 
-
-# Add Coupon
-@bot.message_handler(func=lambda m: m.text=="Add Coupon")
-def add_coupon(message):
-    bot.send_message(message.chat.id,"Format:\namount code\nExample:\n500 ABCD123")
-    bot.register_next_step_handler(message,save_coupon)
-
-
-def save_coupon(message):
     try:
-        amount,code = message.text.split()
-        cursor.execute("INSERT INTO coupons(amount,code) VALUES(?,?)",(int(amount),code))
+        cursor.execute("""
+        INSERT INTO orders (user_id, product_id, quantity, total, utr, screenshot, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, pid, qty, total, utr, file_id, "pending"))
         conn.commit()
-        bot.send_message(message.chat.id,"✅ Coupon Added")
-    except:
-        bot.send_message(message.chat.id,"Invalid format")
 
+        context.user_data.clear()
 
-# Set Price
-@bot.message_handler(func=lambda m: m.text=="Set Price")
-def set_price(message):
-    bot.send_message(message.chat.id,"Format:\namount price\nExample:\n500 25")
-    bot.register_next_step_handler(message,save_price)
+        await update.message.reply_text("✅ Payment Submitted. Waiting Approval.")
 
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🆕 New Order\nUser: {user_id}\nUTR: {utr}\nAmount: ₹{total}"
+        )
 
-def save_price(message):
-    try:
-        amount,price = message.text.split()
-        cursor.execute("UPDATE settings SET price=? WHERE amount=?",(int(price),int(amount)))
-        conn.commit()
-        bot.send_message(message.chat.id,"✅ Price Updated")
-    except:
-        bot.send_message(message.chat.id,"Invalid format")
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("❌ Duplicate UTR or Screenshot")
 
+# ================= RUN ================= #
 
-# Users Count
-@bot.message_handler(func=lambda m: m.text=="Users Count")
-def users_count(message):
-    if message.from_user.id==ADMIN_ID:
-        cursor.execute("SELECT COUNT(*) FROM users")
-        total = cursor.fetchone()[0]
-        bot.send_message(message.chat.id,f"Total Users: {total}")
+app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
-# Broadcast
-@bot.message_handler(func=lambda m: m.text=="Broadcast")
-def broadcast(message):
-    bot.send_message(message.chat.id,"Send broadcast message")
-    bot.register_next_step_handler(message,send_broadcast)
-
-
-def send_broadcast(message):
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-
-    for u in users:
-        try:
-            bot.send_message(u[0],message.text)
-        except:
-            pass
-
-    bot.send_message(message.chat.id,"✅ Broadcast Sent")
-
-
-print("Pro Coupon Bot Running...")
-bot.polling()
+app.run_polling()
