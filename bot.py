@@ -89,6 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📈 Sales", callback_data="sales")],
             [InlineKeyboardButton("👥 Users", callback_data="users")]
         ]
+        [InlineKeyboardButton("💬 Support", callback_data="support")]
         await update.message.reply_text("👑 FULL ADMIN PANEL",
             reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -127,6 +128,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+    # Support button
+elif data == "support":
+    context.user_data.clear()
+    context.user_data["support_mode"] = True
+
+    await query.message.reply_text(
+        "💬 Send your problem. Our support team will reply soon."
+    )
 
     # ---------- BUY PRODUCT ---------- #
     if data.startswith("buy_"):
@@ -283,6 +292,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    # Support system
+elif context.user_data.get("support_mode"):
+
+    message = text
+
+    await context.bot.send_message(
+        ADMIN_ID,
+        f"📩 Support Request\n\nUser: {user_id}\n\nMessage:\n{message}"
+    )
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "✅ Your message has been sent to support."
+    )
 
     # Admin product
     if context.user_data.get("adding_product") and user_id == ADMIN_ID:
@@ -325,42 +349,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["utr"] = text
-        context.user_data["awaiting_utr"] = False
-        context.user_data["awaiting_ss"] = True
-        await update.message.reply_text("📸 Send Payment Screenshot")
 
-# ================= PHOTO HANDLER ================= #
+pid = context.user_data.get("product_id")
+qty = context.user_data.get("quantity")
+total = context.user_data.get("total")
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_ss"):
-        return
+cursor.execute("""
+INSERT INTO orders (user_id, product_id, quantity, total, utr, screenshot, status)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+""", (user_id, pid, qty, total, text, "no_screenshot", "pending"))
 
-    user_id = update.effective_user.id
-    utr = context.user_data.get("utr")
-    pid = context.user_data.get("product_id")
-    qty = context.user_data.get("quantity")
-    total = context.user_data.get("total")
+conn.commit()
+context.user_data.clear()
 
-    file_id = update.message.photo[-1].file_id
+await update.message.reply_text(
+    "✅ Payment Submitted.\n⏳ Waiting for admin approval."
+)
 
-    try:
-        cursor.execute("""
-        INSERT INTO orders (user_id, product_id, quantity, total, utr, screenshot, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, pid, qty, total, utr, file_id, "pending"))
-        conn.commit()
-
-        context.user_data.clear()
-
-        await update.message.reply_text("✅ Payment Submitted. Waiting Approval.")
-
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🆕 New Order\nUser: {user_id}\nUTR: {utr}\nAmount: ₹{total}"
-        )
-
-    except sqlite3.IntegrityError:
-        await update.message.reply_text("❌ Duplicate UTR or Screenshot")
+await context.bot.send_message(
+    ADMIN_ID,
+    f"🆕 New Order\nUser: {user_id}\nUTR: {text}\nAmount: ₹{total}"
+)
 
 # ================= RUN ================= #
 
@@ -369,7 +378,7 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+
 
 keep_alive()
 app.run_polling()
